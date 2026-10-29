@@ -1,8 +1,23 @@
 {
   "name": "@local/dsh-obsidian",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "private": true,
   "description": "Obsidian vault bridge for DeepSeek Harness: sidebar panel, note search, stats and note writing for the agent.",
+  "license": "MIT",
+  "homepage": "https://github.com/hibernate-pano/dsh-obsidian",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hibernate-pano/dsh-obsidian.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "deepseek",
+    "obsidian",
+    "notes",
+    "plugin",
+    "pkm"
+  ],
   "type": "module",
   "exports": {
     ".": "./index.js",
@@ -16,7 +31,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
