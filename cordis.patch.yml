@@ -1,0 +1,5 @@
+# Inserts the Obsidian vault bridge: one Host plugin row that owns the vault
+# index, the agent tools and the panel's HTTP routes.
+- insert:
+    - id: obsidian
+      name: '@local/dsh-obsidian'

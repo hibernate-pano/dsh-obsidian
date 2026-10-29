@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Obsidian 笔记",
+    "description": "挂载本地 Obsidian 笔记库：左侧栏面板可浏览、搜索、预览笔记，同时为 Agent 提供检索、总结、统计与写入笔记的工具。"
+  },
+  "panel": "Obsidian 笔记"
+}

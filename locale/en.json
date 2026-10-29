@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Obsidian Notes",
+    "description": "Mounts an Obsidian vault: a sidebar panel to browse, search and preview notes, plus agent tools to search, summarize, count and write your notes."
+  },
+  "panel": "Obsidian notes"
+}
