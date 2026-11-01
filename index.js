@@ -100,7 +100,7 @@ function parseYamlLite(text) {
 // persisted state (settings the user changes from the panel)
 // ---------------------------------------------------------------------------
 
-/** @type {{ vaultPath: string, writeMode: 'auto' | 'confirm', lastIndexAt: number, disabledFolders: string[] } | null} */
+/** @type {{ vaultPath: string, writeMode: 'auto' | 'confirm', lastIndexAt: number, disabledFolders: string[], folderRoles: Record<string, string[]> | null } | null} */
 let stateCache = null
 
 async function readState() {
@@ -113,9 +113,10 @@ async function readState() {
       writeMode: parsed.writeMode === 'confirm' ? 'confirm' : 'auto',
       lastIndexAt: Number(parsed.lastIndexAt) || 0,
       disabledFolders: Array.isArray(parsed.disabledFolders) ? parsed.disabledFolders.filter((x) => typeof x === 'string') : [],
+      folderRoles: normalizeFolderRoles(parsed.folderRoles),
     }
   } catch {
-    stateCache = { vaultPath: '', writeMode: 'auto', lastIndexAt: 0, disabledFolders: [] }
+    stateCache = { vaultPath: '', writeMode: 'auto', lastIndexAt: 0, disabledFolders: [], folderRoles: null }
   }
   return stateCache
 }
@@ -129,6 +130,63 @@ async function writeState(patch) {
   await fsp.writeFile(tmp, `${JSON.stringify(stateCache, null, 2)}\n`, 'utf8')
   await fsp.rename(tmp, STATE_FILE)
   return stateCache
+}
+
+// ---------------------------------------------------------------------------
+// folder roles: the Q&A ranking used to hardcode 日记/复盘/项目/收藏; now the
+// folder names behind each role are resolved from state.json overrides plus
+// the vault's daily-notes config, so other vaults work out of the box.
+// ---------------------------------------------------------------------------
+
+const ROLE_DEFAULT_DIRS = {
+  journal: ['日记', '日志', 'diary', 'journal', 'daily'],
+  review: ['复盘', '回顾', '周报', '月报', 'review', 'retro', 'weekly'],
+  project: ['项目', 'projects'],
+  notes: ['笔记', 'notes'],
+  clips: ['收藏', '剪藏', 'clips', 'clippings'],
+}
+
+/** @param {unknown} raw @returns {Record<string, string[]> | null} */
+function normalizeFolderRoles(raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const out = {}
+  let used = 0
+  for (const role of Object.keys(ROLE_DEFAULT_DIRS)) {
+    const value = raw[role]
+    if (!Array.isArray(value)) continue
+    const dirs = value.filter((x) => typeof x === 'string' && x.trim() !== '').map((x) => x.trim().replace(/^\/+|\/+$/g, ''))
+    if (dirs.length === 0) continue
+    out[role] = dirs
+    used += 1
+  }
+  return used > 0 ? out : null
+}
+
+/** @param {string} folder @param {string[]} dirs */
+function folderInRole(folder, dirs) {
+  if (!Array.isArray(dirs) || dirs.length === 0) return false
+  const value = String(folder ?? '')
+  if (value === '') return false
+  return dirs.some((name) => name !== '' && (value === name || value.startsWith(`${name}/`)))
+}
+
+/** @type {{ root: string, at: number, roles: Record<string, string[]> | null }} */
+let rolesCache = { root: '', at: 0, roles: null }
+const ROLES_TTL_MS = 60000
+
+/** Resolve role → top-level folder names for one vault, with a short cache. */
+async function getFolderRoles(root) {
+  if (root === '') return { ...ROLE_DEFAULT_DIRS }
+  if (rolesCache.root === root && rolesCache.roles !== null && now() - rolesCache.at < ROLES_TTL_MS) return rolesCache.roles
+  const [state, daily] = await Promise.all([readState(), dailyFormat(root)])
+  const override = state.folderRoles ?? {}
+  const roles = {}
+  for (const [role, defaults] of Object.entries(ROLE_DEFAULT_DIRS)) {
+    roles[role] = Array.isArray(override[role]) && override[role].length > 0 ? [...override[role]] : [...defaults]
+  }
+  if (daily.folder !== '' && !roles.journal.includes(daily.folder)) roles.journal.unshift(daily.folder)
+  rolesCache = { root, at: now(), roles }
+  return roles
 }
 
 // ---------------------------------------------------------------------------
@@ -279,15 +337,34 @@ function folderOf(rel) {
   return dir === '.' ? '' : dir.split(path.sep).join('/')
 }
 
+/** Monday of one ISO week (used by weekly reviews named `2026-W44`). */
+function isoWeekMonday(year, week) {
+  const jan4 = new Date(year, 0, 4, 12, 0, 0)
+  const offset = (jan4.getDay() + 6) % 7
+  const monday = new Date(jan4.getTime())
+  monday.setDate(jan4.getDate() - offset + (week - 1) * 7)
+  return `${monday.getFullYear()}-${String(monday.getMonth() + 1).padStart(2, '0')}-${String(monday.getDate()).padStart(2, '0')}`
+}
+
 /** @param {string} rel @param {Record<string, unknown>} fm */
 function dateOf(rel, fm) {
   const fromPath = /(\d{4})-(\d{2})-(\d{2})/.exec(rel)
   if (fromPath !== null) return `${fromPath[1]}-${fromPath[2]}-${fromPath[3]}`
+  const monthOnly = /(?:^|\/)(\d{4})-(\d{2})\.md$/i.exec(rel)
+  if (monthOnly !== null) return `${monthOnly[1]}-${monthOnly[2]}-01`
   for (const key of ['date', 'created', 'published', 'lastReadDate']) {
     const value = fm[key]
     if (typeof value === 'string') {
       const hit = /(\d{4})-(\d{2})-(\d{2})/.exec(value)
       if (hit !== null) return `${hit[1]}-${hit[2]}-${hit[3]}`
+    }
+  }
+  const week = fm.week
+  if (typeof week === 'string') {
+    const hit = /(\d{4})-W(\d{1,2})/i.exec(week)
+    if (hit !== null) {
+      const weekNumber = Number(hit[2])
+      if (weekNumber >= 1 && weekNumber <= 53) return isoWeekMonday(Number(hit[1]), weekNumber)
     }
   }
   return null
@@ -352,10 +429,19 @@ class VaultIndex {
   constructor() {
     /** @type {string} */ this.root = ''
     /** @type {Map<string, ReturnType<typeof parseNote>>} */ this.notes = new Map()
+    /** @type {Map<string, string[]>} resolved link target → notes linking to it */
+    this.backlinks = new Map()
+    /** @type {Map<string, string[]>} note basename → rels, for `[[name]]` resolution */
+    this._byBase = new Map()
+    /** content version: bumped only when notes actually change, keys the IDF cache */
+    this.version = 0
     this.scannedAt = 0
     this.scanning = null
     this.fileCount = 0
     this.skipped = 0
+    /** @type {Map<string, number> | null} bigram → document frequency */
+    this._gramDf = null
+    this._gramDfVersion = -1
   }
 
   /** @param {string} [root] */
@@ -429,6 +515,7 @@ class VaultIndex {
     await walk(root, 0, '')
 
     const seen = new Set()
+    let changed = false
     for (const abs of files) {
       let st
       try {
@@ -447,15 +534,77 @@ class VaultIndex {
       try {
         const raw = await fsp.readFile(abs, 'utf8')
         this.notes.set(rel, parseNote(rel, raw, st.size, st.mtimeMs))
+        changed = true
       } catch {
         skipped += 1
       }
     }
-    for (const rel of [...this.notes.keys()]) if (!seen.has(rel)) this.notes.delete(rel)
+    // drop cached notes whose file vanished; whatever stays in `seen` vanished
+    for (const rel of [...this.notes.keys()]) {
+      if (seen.has(rel)) {
+        seen.delete(rel)
+        continue
+      }
+      this.notes.delete(rel)
+      changed = true
+    }
     this.fileCount = this.notes.size
     this.skipped = skipped
     this.scannedAt = now()
+    if (changed) {
+      this.version += 1
+      this.#rebuildLinks()
+    }
     return this
+  }
+
+  /** Resolve one `[[target]]` to a vault-relative note path, or null. */
+  resolveLinkTarget(target) {
+    const clean = String(target ?? '').replace(/\.md$/i, '').trim()
+    if (clean === '') return null
+    if (this.notes.has(`${clean}.md`)) return `${clean}.md`
+    if (this.notes.has(clean)) return clean
+    const list = this._byBase.get(path.basename(clean))
+    if (list === undefined || list.length === 0) return null
+    return list.length === 1 ? list[0] : null // ambiguous name: refuse to guess
+  }
+
+  /** wiki-link graph: resolved target → notes that link to it */
+  #rebuildLinks() {
+    const byBase = new Map()
+    for (const rel of this.notes.keys()) {
+      const base = path.basename(rel, path.extname(rel))
+      const list = byBase.get(base)
+      if (list === undefined) byBase.set(base, [rel])
+      else list.push(rel)
+    }
+    this._byBase = byBase
+    const backlinks = new Map()
+    for (const note of this.notes.values()) {
+      for (const target of note.links) {
+        const resolved = this.resolveLinkTarget(target)
+        if (resolved === null || resolved === note.rel) continue
+        const list = backlinks.get(resolved)
+        if (list === undefined) backlinks.set(resolved, [note.rel])
+        else if (!list.includes(note.rel)) list.push(note.rel)
+      }
+    }
+    this.backlinks = backlinks
+  }
+
+  /**
+   * Bigram document frequency, rebuilt lazily only after the notes actually
+   * change. Rare bigrams score higher, which replaces hand-tuned stopword lists.
+   */
+  gramDocumentFrequency() {
+    if (this._gramDf !== null && this._gramDfVersion === this.version) return this._gramDf
+    const df = new Map()
+    for (const note of this.notes.values()) {
+      for (const gram of bigrams(note.search)) df.set(gram, (df.get(gram) ?? 0) + 1)
+    }
+    this._gramDf = df
+    this._gramDfVersion = this.version
+    return df
   }
 
   /** @param {string} rel */
@@ -532,6 +681,20 @@ function searchNotes(index, options) {
   const since = options.since ? String(options.since) : ''
   const until = options.until ? String(options.until) : ''
   const nowMs = now()
+  const df = typeof index.gramDocumentFrequency === 'function' ? index.gramDocumentFrequency() : null
+  const docCount = Math.max(1, index.notes.size)
+  const idf = (gram) => Math.log(1 + docCount / (1 + (df?.get(gram) ?? 0)))
+  // a term is as informative as its grams: 常用词 like 应用 score low, rare
+  // phrases score high — one common-word hit must not read as a match
+  const termWeight = (term) => {
+    const gramsOf = bigrams(term)
+    if (gramsOf.size === 0) return 1
+    let sum = 0
+    for (const g of gramsOf) sum += idf(g)
+    return sum / gramsOf.size / Math.log(1 + docCount)
+  }
+  const termWeights = normTerms.map(termWeight)
+  const termWeightTotal = termWeights.reduce((sum, w) => sum + w, 0)
   /** @type {Array<{ path: string, title: string, date: string | null, score: number, hits: Array<{ line: number, text: string }> }>} */
   const hits = []
 
@@ -549,14 +712,25 @@ function searchNotes(index, options) {
     let phraseHit = has(note.search, phrase)
     if (phraseHit) score += 3
     let termHits = 0
-    for (const t of normTerms) if (has(note.search, t)) termHits += 1
+    let termHitWeight = 0
+    for (let ti = 0; ti < normTerms.length; ti += 1) {
+      if (has(note.search, normTerms[ti])) {
+        termHits += 1
+        termHitWeight += termWeights[ti]
+      }
+    }
     if (termHits === normTerms.length && termHits > 1) score += 2
-    else if (termHits > 0) score += termHits / normTerms.length
+    else if (termHits > 0 && termWeightTotal > 0) score += (termHitWeight / termWeightTotal) * 2
 
     if (grams.size > 0 && !phraseHit) {
-      let covered = 0
-      for (const g of grams) if (has(note.search, g)) covered += 1
-      const ratio = covered / grams.size
+      let coveredWeight = 0
+      let totalWeight = 0
+      for (const g of grams) {
+        const weight = idf(g)
+        totalWeight += weight
+        if (has(note.search, g)) coveredWeight += weight
+      }
+      const ratio = totalWeight > 0 ? coveredWeight / totalWeight : 0
       if (ratio >= 0.6) {
         score += ratio * 2.5
         phraseHit = true
@@ -566,8 +740,12 @@ function searchNotes(index, options) {
     for (const noteTag of note.tags) if (normTerms.includes(norm(noteTag))) score += 2
     if (has(norm(note.rel), phrase)) score += 2
     if (score <= 0) continue
-    const ageDays = note.date === null ? 180 : Math.max(0, (nowMs - Date.parse(`${note.date}T00:00:00`)) / 86400000)
-    score += Math.max(0, 1.2 - ageDays / 240)
+    // recency only amplifies notes that already matched meaningfully; a lone
+    // common-word hit must not ride the freshness bonus into "检索命中"
+    if (score >= 1) {
+      const ageDays = note.date === null ? 180 : Math.max(0, (nowMs - Date.parse(`${note.date}T00:00:00`)) / 86400000)
+      score += Math.max(0, 1.2 - ageDays / 240)
+    }
 
     /** @type {Array<{ line: number, text: string }>} */
     const lineHits = []
@@ -698,6 +876,715 @@ function isoDay(offsetDays = 0, base = new Date()) {
 }
 
 // ---------------------------------------------------------------------------
+// global Q&A: date ranges, vault retrieval, streamed model answers
+// ---------------------------------------------------------------------------
+
+const ASK_SYSTEM_PROMPT = [
+  '你是「Obsidian 笔记库」的全局问答助手。你只能依据用户笔记库中提供的摘录回答，不能使用外部知识编造用户没有写过的内容。',
+  '',
+  '回答规则：',
+  '1. 先用一两句话给出结论，再展开依据；用简洁的小标题或列表组织长回答。',
+  '2. 引用笔记时在句末写 [[vault 相对路径]]，路径必须来自提供的摘录，不能编造。',
+  '3. 如果摘录不足以回答，明确说“笔记里没有足够信息”，并说明还缺什么；不要猜测。',
+  '4. 对“工作状态 / 最近一个月”这类问题：总结整体节奏、主要事项、反复出现的问题或情绪、待办与风险，尽量引用日期和原文细节。',
+  '5. 对“待办”类问题：按笔记分组列出未完成事项，指出长期未完成或反复出现的事项。',
+  '6. 不要提及“上下文”“摘录”“检索”这些实现词，直接像一位熟悉用户笔记的助理一样回答。',
+  '7. 默认用中文回答；用户用其他语言提问时跟随用户语言。',
+].join('\n')
+
+const CN_DIGITS = { 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 }
+
+function pad2(value) {
+  return String(value).padStart(2, '0')
+}
+
+/** Local YYYY-MM-DD, never UTC, so daily notes line up with the user's day. */
+function dayString(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value)
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+}
+
+function dayFromString(value) {
+  const [year, month, day] = String(value).split('-').map(Number)
+  return new Date(year, month - 1, day, 12, 0, 0)
+}
+
+function shiftDay(value, offset) {
+  const date = dayFromString(value)
+  date.setDate(date.getDate() + offset)
+  return dayString(date)
+}
+
+function mondayOf(value) {
+  const date = dayFromString(value)
+  const offset = (date.getDay() + 6) % 7
+  date.setDate(date.getDate() - offset)
+  return dayString(date)
+}
+
+function parseCnNumber(token) {
+  if (/^\d+$/.test(token)) return Number(token)
+  if (token === '十') return 10
+  if (token.length === 1) return CN_DIGITS[token] ?? null
+  if (token.startsWith('十')) return 10 + (CN_DIGITS[token[1]] ?? 0)
+  if (token.endsWith('十')) return (CN_DIGITS[token[0]] ?? 0) * 10
+  if (token.includes('十')) {
+    const [tens, ones] = token.split('十')
+    return (CN_DIGITS[tens] ?? 0) * 10 + (CN_DIGITS[ones] ?? 0)
+  }
+  return null
+}
+
+/**
+ * Resolve the time range a question talks about. Returns null when the
+ * question carries no explicit time expression.
+ * @param {string} question
+ * @param {Date} [now]
+ */
+function detectAskRange(question, now = new Date()) {
+  const text = String(question ?? '')
+  const today = dayString(now)
+  let match
+
+  const fixed = (start, end, label, matched) => ({ start, end, label, matched })
+  if (/今天|今日/.test(text)) return fixed(today, today, '今天', text.match(/今天|今日/)[0])
+  if (/昨天|昨日/.test(text)) {
+    const day = shiftDay(today, -1)
+    return fixed(day, day, '昨天', text.match(/昨天|昨日/)[0])
+  }
+  if (/前天/.test(text)) {
+    const day = shiftDay(today, -2)
+    return fixed(day, day, '前天', '前天')
+  }
+  if (/本周|这周|这一周|本星期/.test(text)) return fixed(mondayOf(today), today, '本周', text.match(/本周|这周|这一周|本星期/)[0])
+  if (/上周|上个星期|上星期/.test(text)) {
+    const monday = mondayOf(shiftDay(today, -7))
+    return fixed(monday, shiftDay(monday, 6), '上周', text.match(/上周|上个星期|上星期/)[0])
+  }
+  if (/本月|这个月|当月/.test(text)) return fixed(`${today.slice(0, 8)}01`, today, '本月', text.match(/本月|这个月|当月/)[0])
+  if (/上个月|上月/.test(text)) {
+    const firstOfThisMonth = dayFromString(`${today.slice(0, 8)}01`)
+    const end = new Date(firstOfThisMonth.getFullYear(), firstOfThisMonth.getMonth(), 0, 12, 0, 0)
+    const start = new Date(end.getFullYear(), end.getMonth(), 1, 12, 0, 0)
+    return fixed(dayString(start), dayString(end), '上个月', text.match(/上个月|上月/)[0])
+  }
+  if (/今年|年初至今|本年/.test(text)) return fixed(`${today.slice(0, 4)}-01-01`, today, '今年', text.match(/今年|年初至今|本年/)[0])
+  if (/去年|上一年/.test(text)) {
+    const year = Number(today.slice(0, 4)) - 1
+    return fixed(`${year}-01-01`, `${year}-12-31`, '去年', text.match(/去年|上一年/)[0])
+  }
+
+  match = /(?:最近|近)\s*([0-9一二两三四五六七八九十]+)\s*(天|日|周|星期|个月|月|年)/.exec(text)
+  if (match !== null) {
+    const count = parseCnNumber(match[1])
+    if (count !== null && count > 0) {
+      const unit = match[2]
+      const days = unit === '天' || unit === '日' ? count : unit === '周' || unit === '星期' ? count * 7 : unit === '年' ? count * 365 : count * 30
+      return fixed(shiftDay(today, -(days - 1)), today, match[0].replace(/\s+/g, ''), match[0])
+    }
+  }
+  if (/最近半年|近半年/.test(text)) return fixed(shiftDay(today, -179), today, '最近半年', text.match(/最近半年|近半年/)[0])
+  if (/最近一年|近一年/.test(text)) return fixed(shiftDay(today, -364), today, '最近一年', text.match(/最近一年|近一年/)[0])
+
+  match = /(\d{4})\s*年\s*(\d{1,2})\s*月/.exec(text)
+  if (match !== null) {
+    const year = Number(match[1])
+    const month = Number(match[2])
+    if (month >= 1 && month <= 12) {
+      const start = new Date(year, month - 1, 1, 12, 0, 0)
+      const end = new Date(year, month, 0, 12, 0, 0)
+      return fixed(dayString(start), dayString(end), `${year}年${month}月`, match[0])
+    }
+  }
+
+  match = /(?:^|[^\d])(\d{1,2})\s*月/.exec(text)
+  if (match !== null) {
+    const month = Number(match[1])
+    if (month >= 1 && month <= 12) {
+      const year = Number(today.slice(0, 4))
+      const start = new Date(year, month - 1, 1, 12, 0, 0)
+      const end = new Date(year, month, 0, 12, 0, 0)
+      return fixed(dayString(start), dayString(end), `${year}年${month}月`, match[0])
+    }
+  }
+  if (/最近|近期/.test(text)) return fixed(shiftDay(today, -13), today, '最近两周', text.match(/最近|近期/)[0])
+  return null
+}
+
+/** Strip time phrases and conversational filler to get searchable terms. */
+function cleanAskQuery(question, range) {
+  let text = String(question ?? '')
+  if (range !== null && range.matched) text = text.replace(range.matched, ' ')
+  return text
+    .replace(/[，。！？、,.!?;；:："'“”‘’（）()【】\[\]]/g, ' ')
+    .replace(/请问|帮我|帮忙|看看|看一下|告诉我|说一说|说说|总结一下|总结|整理一下|整理|概括|梳理|分析一下|分析|最近|近期|一下|我的|我|有哪些|有什么|怎么样|如何|多少|状态|情况|相关|现在|目前|的|了|在|是|什么|事项/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** Note's best known day: frontmatter/date from path, else file mtime. */
+function noteDay(note) {
+  return note.date !== null && note.date !== undefined ? note.date : dayString(new Date(note.mtimeMs))
+}
+
+/** Collect unchecked `- [ ]` tasks, optionally limited to a date range. */
+function collectOpenTasks(index, range) {
+  const rows = []
+  for (const note of index.notes.values()) {
+    const day = noteDay(note)
+    if (range !== null && (day < range.start || day > range.end)) continue
+    let heading = ''
+    for (const line of note.text.split(/\r?\n/)) {
+      const headingMatch = /^(#{1,6})[ \t]+(.+?)[ \t]*$/.exec(line)
+      if (headingMatch !== null) {
+        heading = headingMatch[2]
+        continue
+      }
+      const taskMatch = /^[ \t]*[-*+][ \t]+\[[ ]\][ \t]+(.+)$/.exec(line)
+      if (taskMatch !== null) {
+        rows.push({ path: note.rel, title: note.title, date: note.date, heading, text: taskMatch[1].trim().slice(0, 200) })
+        if (rows.length >= 160) return rows
+      }
+    }
+  }
+  return rows
+}
+
+const EXCERPT_WINDOW_LIMIT = 9
+
+/**
+ * Pick the excerpt window with the densest term hits instead of always
+ * starting at the first match: a note may mention the topic once early on and
+ * elaborate much later.
+ * @param {string} body @param {string[]} terms @param {number} limit
+ */
+function excerptAround(body, terms, limit) {
+  const text = String(body ?? '').trim()
+  if (text === '') return ''
+  const lowered = text.toLowerCase()
+  const needles = [...new Set(terms.map((term) => String(term ?? '').trim().toLowerCase()).filter((n) => n.length >= 2))]
+  /** @type {number[]} */
+  const starts = [0]
+  for (const needle of needles) {
+    let from = 0
+    for (let k = 0; k < 3 && starts.length < EXCERPT_WINDOW_LIMIT; k += 1) {
+      const index = lowered.indexOf(needle, from)
+      if (index === -1) break
+      starts.push(Math.max(0, index - 320))
+      from = index + needle.length
+    }
+    if (starts.length >= EXCERPT_WINDOW_LIMIT) break
+  }
+  const hitsIn = (start) => {
+    const slice = lowered.slice(start, Math.min(text.length, start + limit))
+    let count = 0
+    for (const needle of needles) {
+      let from = 0
+      for (;;) {
+        const found = slice.indexOf(needle, from)
+        if (found === -1) break
+        count += 1
+        from = found + needle.length
+      }
+    }
+    return count
+  }
+  let best = 0
+  let bestHits = -1
+  const seenKeys = new Set()
+  for (const rawStart of starts) {
+    const key = Math.round(rawStart / 240)
+    if (seenKeys.has(key)) continue
+    seenKeys.add(key)
+    const hits = hitsIn(rawStart)
+    if (hits > bestHits || (hits === bestHits && rawStart < best)) {
+      bestHits = hits
+      best = rawStart
+    }
+  }
+  let out = text.slice(best, best + limit)
+  if (best > 0) out = `…${out}`
+  if (best + limit < text.length) out = `${out}…`
+  return out
+}
+
+/** Compact scalar frontmatter for the model (weight, uric acid, glucose, mood…). */
+function frontmatterLine(fm) {
+  if (fm === null || typeof fm !== 'object') return ''
+  const skip = new Set(['tags', 'title', 'date', 'created', 'published', 'lastReadDate', 'aliases', 'cssclasses', 'week'])
+  const parts = []
+  for (const [key, value] of Object.entries(fm)) {
+    if (skip.has(key) || value === null || value === undefined) continue
+    let text
+    if (Array.isArray(value)) text = value.map(String).join(', ')
+    else if (typeof value === 'object') continue
+    else text = String(value)
+    if (text === '' || text.length > 160) continue
+    parts.push(`${key}: ${text}`)
+    if (parts.length >= 8) break
+  }
+  return parts.join(' · ')
+}
+
+/** Notes in journal/review folders answer "how am I doing" better than clips. */
+function askFolderWeight(note, question, roles) {
+  const folder = String(note.folder ?? '')
+  let weight = 0
+  if (folderInRole(folder, roles.journal)) weight += 4.5
+  if (folderInRole(folder, roles.review)) weight += 4
+  if (folderInRole(folder, roles.project)) weight += 2
+  if (folderInRole(folder, roles.notes)) weight += 1
+  if (folderInRole(folder, roles.clips)) weight -= question.includes('收藏') ? 0 : 6
+  return weight
+}
+
+/** Keep "journal" and "review" questions inside their own folders, and keep clippings out unless asked for. */
+function askNoteAllowed(note, question, roles) {
+  const folder = String(note.folder ?? '')
+  const isJournal = folderInRole(folder, roles.journal)
+  const isReview = folderInRole(folder, roles.review)
+  const isClip = folderInRole(folder, roles.clips)
+  if (/日记|日志|journal/i.test(question) && !isJournal) return false
+  if (/复盘|周报|月报|review/i.test(question) && !isReview) return false
+  if (isClip && !/收藏|剪藏|文章|书|摘录|引用|clip/i.test(question)) return false
+  return true
+}
+
+/**
+ * Build the model-facing context for one question from the in-memory index.
+ * @param {VaultIndex} index
+ * @param {string} question
+ * @param {Date} [now]
+ * @param {{ question?: string, sources?: Array<{path: string}>, range?: {label?: string, start: string, end: string} | null }} [prior]
+ *   retrieval prior from the previous turn, so follow-ups stay in scope
+ * @param {Record<string, string[]>} [roles] resolved folder roles
+ */
+function buildAskBundle(index, question, now = new Date(), prior = null, roles = { ...ROLE_DEFAULT_DIRS }) {
+  const detectedRange = detectAskRange(question, now)
+  const range = detectedRange !== null ? detectedRange : prior?.range ?? null
+  const cleaned = cleanAskQuery(question, detectedRange)
+  const wantsTodo = /待办|todo|任务|清单|未完成|checklist/i.test(question)
+  const wantsCount = /多少|几篇|几则|几个|数量|统计/.test(question)
+  const stats = computeStats(index, { groupBy: 'folder' })
+  const notes = [...index.notes.values()]
+
+  const candidates = new Map()
+  const bump = (note, score, reason) => {
+    if (note === null || note === undefined) return
+    if (!askNoteAllowed(note, question, roles)) return
+    const weighted = score + askFolderWeight(note, question, roles)
+    const previous = candidates.get(note.rel)
+    if (previous === undefined) candidates.set(note.rel, { note, score: weighted, reasons: [reason] })
+    else {
+      previous.score = Math.max(previous.score, weighted)
+      if (!previous.reasons.includes(reason)) previous.reasons.push(reason)
+    }
+  }
+
+  const hitByPath = new Map()
+  let searchQuery = cleaned !== '' ? cleaned : question
+  if (prior !== null && typeof prior.question === 'string') {
+    const priorCleaned = cleanAskQuery(prior.question, detectAskRange(prior.question, now))
+    const ownWords = cleaned.split(/\s+/).filter((word) => word !== '')
+    if (priorCleaned !== '' && ownWords.length <= 2) searchQuery = `${cleaned} ${priorCleaned}`.trim()
+  }
+  let hits = []
+  try {
+    hits = searchNotes(index, {
+      query: searchQuery,
+      limit: 32,
+      since: range === null ? undefined : range.start,
+      until: range === null ? undefined : range.end,
+    })
+  } catch {
+    hits = []
+  }
+  for (const hit of hits) hitByPath.set(hit.path, hit)
+  if (hitByPath.size < 6 && cleaned !== '' && cleaned !== question) {
+    try {
+      for (const hit of searchNotes(index, { query: question, limit: 24, since: range === null ? undefined : range.start, until: range === null ? undefined : range.end })) {
+        if (!hitByPath.has(hit.path)) hitByPath.set(hit.path, hit)
+      }
+    } catch {
+      /* search is best-effort; dated notes still answer range questions */
+    }
+  }
+  // a hit below 1 is a common-word graze, not evidence — it must not become a
+  // strong "检索命中" or defeat the honest weak-retrieval signal
+  for (const hit of hitByPath.values()) {
+    if ((Number(hit.score) || 0) < 1) continue
+    bump(index.get(hit.path), 12 + Math.min(8, Number(hit.score) || 0), '检索命中')
+  }
+
+  // carry the previous answer's notes over so "展开第二点" keeps its scope
+  if (prior !== null && Array.isArray(prior.sources)) {
+    for (const source of prior.sources.slice(0, 30)) {
+      if (source === null || typeof source !== 'object') continue
+      const rel = String(source.path ?? '').trim()
+      if (rel === '') continue
+      bump(index.get(rel), 7, '承接上文')
+    }
+  }
+
+  if (range !== null) {
+    for (const note of notes) {
+      if (note.date === null || note.date === undefined) continue
+      if (note.date < range.start || note.date > range.end) continue
+      const ageDays = Math.max(0, (dayFromString(range.end).getTime() - dayFromString(note.date).getTime()) / 86400000)
+      let score = 8 + Math.max(0, 3 - ageDays / 12)
+      if (folderInRole(note.folder, roles.journal) || folderInRole(note.folder, roles.review) || folderInRole(note.folder, roles.project) || /工作/.test(note.folder) || note.tags.some((tag) => /工作|复盘|项目/.test(tag))) score += 1.5
+      bump(note, score, '时间范围内')
+    }
+  }
+
+  const openTasks = wantsTodo ? collectOpenTasks(index, range) : []
+  openTasks.sort((a, b) => {
+    const left = a.date ?? ''
+    const right = b.date ?? ''
+    return right.localeCompare(left) || a.path.localeCompare(b.path, 'zh')
+  })
+  for (const task of openTasks) {
+    const ageDays = task.date === null ? 365 : Math.max(0, (dayFromString(dayString(now)).getTime() - dayFromString(task.date).getTime()) / 86400000)
+    bump(index.get(task.path), 10.5 + Math.max(0, 4 - ageDays / 30), '未完成待办')
+  }
+
+  // one link-graph hop around the strongest candidates: notes that cite them
+  // (or that they cite) often answer the question without sharing keywords.
+  // Fallback seeds (最近更新) stay out, so padding never breeds "strong" hits.
+  if (candidates.size > 0 && index.backlinks instanceof Map) {
+    const strongSeedReasons = new Set(['检索命中', '时间范围内', '未完成待办', '承接上文'])
+    const seeds = [...candidates.values()]
+      .sort((a, b) => b.score - a.score)
+      .filter((seed) => seed.reasons.some((reason) => strongSeedReasons.has(reason)))
+      .slice(0, 10)
+    for (const seed of seeds) {
+      const linked = new Set()
+      for (const target of seed.note.links) {
+        const resolved = index.resolveLinkTarget(target)
+        if (resolved !== null) linked.add(resolved)
+      }
+      for (const source of index.backlinks.get(seed.note.rel) ?? []) linked.add(source)
+      for (const rel of linked) bump(index.get(rel), Math.max(2.5, seed.score * 0.35), '链接关联')
+    }
+  }
+
+  if (candidates.size < 6 && range === null) {
+    const recent = notes.slice().sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, 12)
+    for (const note of recent) bump(note, 2, '最近更新')
+  }
+
+  const ranked = [...candidates.values()].sort((a, b) => b.score - a.score)
+  const excerptTerms = [cleaned, question]
+  if (prior !== null && typeof prior.question === 'string' && prior.question.trim() !== '') excerptTerms.push(prior.question)
+  const selected = []
+  let used = 0
+  const budget = 56000
+  for (const row of ranked) {
+    if (selected.length >= 18) break
+    const note = row.note
+    const inRange = range !== null && note.date !== null && note.date !== undefined && note.date >= range.start && note.date <= range.end
+    const limit = inRange ? 2400 : 1600
+    const excerpt = excerptAround(note.text, excerptTerms, limit)
+    if (excerpt === '') continue
+    if (selected.length >= 6 && used + excerpt.length > budget) break
+    used += excerpt.length
+    selected.push({
+      path: note.rel,
+      title: note.title,
+      date: note.date,
+      folder: note.folder,
+      meta: frontmatterLine(note.fm),
+      excerpt,
+      reasons: row.reasons,
+    })
+  }
+
+  const strongReasons = new Set(['检索命中', '时间范围内', '未完成待办', '链接关联'])
+  const strongMatches = selected.filter((row) => row.reasons.some((reason) => strongReasons.has(reason))).length
+
+  const folderLine = stats.rows.slice(0, 8).map((row) => `${row.key}（${row.count}）`).join('；')
+  const tasksOpen = Math.max(0, stats.tasksTotal - stats.tasksDone)
+  const blocks = [
+    `【库概览】\n- 笔记 ${stats.noteCount} 篇；目录 ${stats.rows.length} 个\n- 待办 ${stats.tasksDone}/${stats.tasksTotal} 已完成${stats.completion === null ? '' : `（${stats.completion}%）`}，未完成 ${tasksOpen} 条\n- 目录分布：${folderLine || '—'}`,
+  ]
+  if (range !== null) {
+    const inRange = notes.filter((note) => note.date !== null && note.date !== undefined && note.date >= range.start && note.date <= range.end)
+    const daily = inRange.filter((note) => folderInRole(note.folder, roles.journal)).length
+    const reviews = inRange.filter((note) => folderInRole(note.folder, roles.review)).length
+    const rangeTasksTotal = inRange.reduce((sum, note) => sum + (Number(note.tasksTotal) || 0), 0)
+    const rangeTasksDone = inRange.reduce((sum, note) => sum + (Number(note.tasksDone) || 0), 0)
+    const rangeTasksOpen = Math.max(0, rangeTasksTotal - rangeTasksDone)
+    const rangeCompletion = rangeTasksTotal === 0 ? null : Math.round((rangeTasksDone / rangeTasksTotal) * 100)
+    blocks.push(`【时间范围】${range.label}（${range.start} 至 ${range.end}）\n- 范围内有日期的笔记 ${inRange.length} 篇，其中日记 ${daily} 篇、复盘 ${reviews} 篇\n- 范围内待办 ${rangeTasksDone}/${rangeTasksTotal} 已完成${rangeCompletion === null ? '' : `（${rangeCompletion}%）`}，未完成 ${rangeTasksOpen} 条。回答该范围完成占比时以这组数字为准。`)
+  }
+  if (wantsCount) {
+    let subset = notes
+    if (range !== null) subset = subset.filter((note) => note.date !== null && note.date !== undefined && note.date >= range.start && note.date <= range.end)
+    if (/日记/.test(question)) subset = subset.filter((note) => folderInRole(note.folder, roles.journal))
+    else if (/复盘/.test(question)) subset = subset.filter((note) => folderInRole(note.folder, roles.review))
+    else if (/笔记/.test(question)) subset = subset.filter((note) => !folderInRole(note.folder, roles.clips))
+    blocks.push(`【精确统计】\n- 符合问题条件的笔记共 ${subset.length} 篇${range === null ? '' : `（${range.label}）`}。回答数量题时以这个数字为准，不要重新估算。`)
+  }
+  if (wantsTodo && openTasks.length > 0) {
+    const shown = openTasks.slice(0, 80)
+    blocks.push(`【未完成待办】共 ${openTasks.length} 条${openTasks.length > shown.length ? `（显示前 ${shown.length} 条）` : ''}\n${shown.map((task) => `- [[${task.path}]]${task.heading !== '' ? ` · ${task.heading}` : ''}：${task.text}`).join('\n')}`)
+  }
+  blocks.push(`【相关笔记】\n${selected.map((row, index) => `### ${index + 1}. ${row.path}${row.date === null ? '' : `（${row.date}）`}\n${row.meta === '' ? '' : `元数据：${row.meta}\n`}${row.excerpt}`).join('\n\n')}`)
+  if (strongMatches === 0) {
+    blocks.push('【检索说明】本次没有检索到与问题强相关的笔记（下面的摘录只是近期内容兜底）。如果笔记里确实没有相关记录，请在回答开头明确说明，不要依据这些兜底内容硬答。')
+  }
+
+  const user = `当前日期：${dayString(now)}\n问题：${question}\n\n${blocks.join('\n\n')}`
+  return {
+    system: ASK_SYSTEM_PROMPT,
+    user,
+    range,
+    sources: selected.map((row) => ({ path: row.path, title: row.title, date: row.date, folder: row.folder, reason: row.reasons.join('、') })),
+    matched: selected.length,
+    strongMatches,
+    openTasks: openTasks.length,
+    stats: { noteCount: stats.noteCount, folderCount: stats.rows.length, tasksTotal: stats.tasksTotal, tasksDone: stats.tasksDone },
+  }
+}
+
+/** Tolerant provider entry: adapter registrations use several shapes. */
+function providerEntryOf(entry) {
+  if (entry === null || typeof entry !== 'object') return null
+  const candidates = [entry.provider, entry.route, entry.id]
+  const provider = candidates.find((value) => typeof value === 'string' && value.trim() !== '')
+  if (provider === undefined) return null
+  const label = [entry.name, entry.displayName, entry.label, entry.title].find((value) => typeof value === 'string' && value.trim() !== '') ?? provider
+  return { provider: provider.trim(), label: label.trim() }
+}
+
+/** Tolerant model entry. */
+function modelEntryOf(entry) {
+  if (entry === null || typeof entry !== 'object') return null
+  const candidates = [entry.id, entry.model, entry.name]
+  const id = candidates.find((value) => typeof value === 'string' && value.trim() !== '')
+  if (id === undefined) return null
+  const label = [entry.name, entry.displayName, entry.label, entry.title].find((value) => typeof value === 'string' && value.trim() !== '') ?? id
+  return { id: id.trim(), name: label.trim() }
+}
+
+/** The route new DSH chats are currently using, if exposed. */
+function currentDefaultRoute(ctx) {
+  try {
+    const selection = ctx.get('agentDefaultModel')?.currentSelection?.()
+    if (selection !== null && selection !== undefined && typeof selection.provider === 'string' && selection.provider !== '' && typeof selection.model === 'string' && selection.model !== '') {
+      return { provider: selection.provider, model: selection.model }
+    }
+  } catch {
+    /* the default model service is optional */
+  }
+  return null
+}
+
+/** Full provider/model catalog for the panel's custom selector. */
+async function listModelCatalog(ctx, llm) {
+  const current = currentDefaultRoute(ctx)
+  const providers = []
+  if (typeof llm.listProviders === 'function') {
+    let listed = []
+    try {
+      listed = await llm.listProviders()
+    } catch {
+      listed = []
+    }
+    for (const entry of Array.isArray(listed) ? listed : []) {
+      const provider = providerEntryOf(entry)
+      if (provider === null) continue
+      let models = []
+      if (typeof llm.listModels === 'function') {
+        try {
+          const rows = await llm.listModels(provider.provider)
+          models = (Array.isArray(rows) ? rows : []).flatMap((row) => {
+            const model = modelEntryOf(row)
+            return model === null ? [] : [model]
+          }).slice(0, 40)
+        } catch {
+          models = []
+        }
+      }
+      if (models.length > 0) providers.push({ provider: provider.provider, name: provider.label, models })
+    }
+  }
+  return { current, providers }
+}
+
+/** Resolve a custom route when it is usable, else fall back to DSH's current route. */
+async function resolveAskRoute(ctx, llm, requested) {
+  const provider = typeof requested?.provider === 'string' ? requested.provider.trim() : ''
+  const model = typeof requested?.model === 'string' ? requested.model.trim() : ''
+  if (provider !== '' && model !== '') {
+    let usable = true
+    if (typeof llm.resolveModelInfo === 'function') {
+      try {
+        await llm.resolveModelInfo(provider, model)
+      } catch {
+        usable = false
+      }
+    }
+    if (usable) return { provider, model, source: 'custom' }
+  }
+  const fallback = currentDefaultRoute(ctx)
+  if (fallback !== null) {
+    return {
+      ...fallback,
+      source: 'default',
+      ...(provider !== '' && model !== '' ? { fallbackFrom: `${provider}/${model}` } : {}),
+    }
+  }
+  if (typeof llm.listProviders === 'function') {
+    const providers = await llm.listProviders()
+    for (const entry of Array.isArray(providers) ? providers : []) {
+      const route = providerEntryOf(entry)
+      if (route === null) continue
+      const models = await llm.listModels(route.provider)
+      const first = Array.isArray(models) ? models.find((item) => modelEntryOf(item) !== null) : undefined
+      if (first !== undefined) {
+        const modelEntry = modelEntryOf(first)
+        return {
+          provider: route.provider,
+          model: modelEntry.id,
+          source: 'default',
+          ...(provider !== '' && model !== '' ? { fallbackFrom: `${provider}/${model}` } : {}),
+        }
+      }
+    }
+  }
+  throw new Error('当前环境没有可用的模型服务')
+}
+
+/** Pick a reasoning effort: fast by default, stronger when the user asks. */
+async function chooseAskEffort(llm, provider, model, deep) {
+  if (typeof llm.resolveModelInfo !== 'function') return undefined
+  try {
+    const info = await llm.resolveModelInfo(provider, model)
+    const efforts = info?.reasoning?.efforts
+    if (!Array.isArray(efforts) || efforts.length === 0) return undefined
+    const ids = efforts.map((effort) => String(effort.id))
+    const order = deep ? ['high', 'max', 'medium', 'low'] : ['low', 'medium', 'high', 'max']
+    for (const candidate of order) if (ids.includes(candidate)) return candidate
+    return ids[0]
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Stream one answer into the caller's event sink.
+ * @param {any} ctx
+ * @param {VaultIndex} index
+ * @param {{ question: string, history?: unknown, deep?: boolean, provider?: string, model?: string }} request
+ * @param {(event: Record<string, unknown>) => void} emit
+ * @param {AbortSignal} signal
+ */
+/** Validate the client-sent previous-turn prior before it touches retrieval. */
+function sanitizeAskPrior(raw) {
+  if (raw === null || typeof raw !== 'object') return null
+  const prior = {}
+  if (typeof raw.question === 'string' && raw.question.trim() !== '') prior.question = raw.question.trim().slice(0, 2000)
+  if (Array.isArray(raw.sources)) {
+    const sources = []
+    for (const item of raw.sources.slice(0, 30)) {
+      if (item === null || typeof item !== 'object') continue
+      const rel = String(item.path ?? '').trim()
+      if (rel !== '' && rel.length <= 400) sources.push({ path: rel })
+    }
+    if (sources.length > 0) prior.sources = sources
+  }
+  if (raw.range !== null && typeof raw.range === 'object') {
+    const start = String(raw.range.start ?? '')
+    const end = String(raw.range.end ?? '')
+    if (/^\d{4}-\d{2}-\d{2}$/.test(start) && /^\d{4}-\d{2}-\d{2}$/.test(end) && start <= end) {
+      prior.range = { label: typeof raw.range.label === 'string' ? raw.range.label.slice(0, 60) : '', start, end }
+    }
+  }
+  return Object.keys(prior).length > 0 ? prior : null
+}
+
+async function streamAskAnswer(ctx, index, request, emit, signal) {
+  const llm = ctx.get('llm')
+  if (llm === undefined || llm === null || typeof llm.stream !== 'function') throw new Error('当前环境没有可用的模型服务')
+  const route = await resolveAskRoute(ctx, llm, { provider: request.provider, model: request.model })
+  const roles = await getFolderRoles(index.root)
+  const bundle = buildAskBundle(index, request.question, new Date(), sanitizeAskPrior(request.prior), roles)
+  const effort = await chooseAskEffort(llm, route.provider, route.model, request.deep === true)
+  emit({
+    type: 'meta',
+    provider: route.provider,
+    model: route.model,
+    modelSource: route.source ?? 'default',
+    fallbackFrom: route.fallbackFrom ?? null,
+    effort: effort ?? null,
+    sources: bundle.sources,
+    range: bundle.range,
+    matched: bundle.matched,
+    strongMatches: bundle.strongMatches,
+    openTasks: bundle.openTasks,
+    noteCount: bundle.stats.noteCount,
+  })
+
+  const history = Array.isArray(request.history) ? request.history.slice(-6) : []
+  let historyText = ''
+  for (const item of history) {
+    if (item === null || typeof item !== 'object') continue
+    const role = item.role === 'assistant' ? '助手' : '用户'
+    const text = String(item.text ?? '').trim().slice(0, 1800)
+    if (text !== '') historyText += `${role}：${text}\n`
+  }
+  const userText = historyText === '' ? bundle.user : `【最近对话】\n${historyText}\n${bundle.user}`
+  const messages = [{ role: 'user', content: [{ type: 'text', text: userText }] }]
+
+  let characters = 0
+  let finishKind = 'stop'
+  let usage = null
+  let noticedReasoning = false
+  const stream = llm.stream({
+    provider: route.provider,
+    model: route.model,
+    messages,
+    system: bundle.system,
+    maxTokens: request.deep === true ? 4200 : 3000,
+    temperature: 0.35,
+    ...(effort === undefined ? {} : { reasoningEffort: effort }),
+    signal,
+  })
+
+  for await (const chunk of stream) {
+    if (signal.aborted) {
+      finishKind = 'aborted'
+      break
+    }
+    if (chunk === null || typeof chunk !== 'object') continue
+    if (chunk.type === 'text-delta') {
+      const text = String(chunk.text ?? '')
+      if (text === '') continue
+      characters += text.length
+      emit({ type: 'delta', text })
+      continue
+    }
+    if (chunk.type === 'reasoning-delta') {
+      if (!noticedReasoning) {
+        noticedReasoning = true
+        emit({ type: 'phase', phase: 'thinking' })
+      }
+      continue
+    }
+    if (chunk.type === 'usage') {
+      usage = chunk.usage ?? null
+      continue
+    }
+    if (chunk.type === 'finish') {
+      finishKind = chunk.reason?.kind ?? 'stop'
+      if (finishKind === 'error') throw new Error(chunk.reason?.failure?.message ?? '模型调用失败')
+    }
+  }
+  emit({ type: 'done', characters, finish: finishKind, usage })
+}
+
+// ---------------------------------------------------------------------------
 // writes
 // ---------------------------------------------------------------------------
 
@@ -805,6 +1692,80 @@ async function appendNote(root, request) {
   const backup = await backupFile(root, rel)
   await atomicWrite(abs, next)
   return { path: rel, bytes: Buffer.byteLength(next, 'utf8'), backup, appended: text.length }
+}
+
+/**
+ * Literal search/replace inside one note, always backed up first. Refuses
+ * ambiguous matches so an agent never rewrites the wrong passage.
+ * @param {string} root
+ * @param {{ path: string, find: string, replace: string, replaceAll?: boolean }} request
+ */
+async function editNote(root, request) {
+  const rel = String(request.path).replaceAll('\\', '/').replace(/^\/+/, '')
+  if (rel === '' || rel.endsWith('/')) throw new Error('需要文件路径，例如 项目/计划.md')
+  const find = String(request.find ?? '')
+  if (find === '') throw new Error('find 不能为空')
+  const replace = String(request.replace ?? '')
+  const abs = absOf(root, rel)
+  let current
+  try {
+    current = await fsp.readFile(abs, 'utf8')
+  } catch {
+    throw new Error(`文件不存在：${rel}`)
+  }
+  let count = 0
+  let from = 0
+  for (;;) {
+    const index = current.indexOf(find, from)
+    if (index === -1) break
+    count += 1
+    from = index + find.length
+    if (count > 500) break
+  }
+  if (count === 0) throw new Error(`没有找到要替换的文本：${find.slice(0, 60)}${find.length > 60 ? '…' : ''}`)
+  if (count > 1 && request.replaceAll !== true) {
+    throw new Error(`该文本出现 ${count} 次。请让 find 更长更具体，或明确 replaceAll: true。`)
+  }
+  const next = request.replaceAll === true ? current.split(find).join(replace) : current.replace(find, replace)
+  const backup = await backupFile(root, rel)
+  await atomicWrite(abs, next)
+  return { path: rel, changes: request.replaceAll === true ? count : 1, bytes: Buffer.byteLength(next, 'utf8'), backup }
+}
+
+/** Sanitize a question into a safe note filename segment. */
+function askSaveSlug(question) {
+  const cleaned = String(question ?? '')
+    .replace(/[\\/:*?"<>|#^[\]]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 40)
+  return cleaned === '' ? '问答' : cleaned
+}
+
+/** Render one Q&A turn as a note body the vault can keep. */
+function askSaveMarkdown(question, answer, sources) {
+  const list = Array.isArray(sources)
+    ? sources
+        .filter((source) => source !== null && typeof source === 'object' && String(source.path ?? '').trim() !== '')
+        .map((source) => `- [[${String(source.path).trim()}]]${typeof source.title === 'string' && source.title !== '' ? `（${source.title}）` : ''}`)
+    : []
+  return [
+    '---',
+    'tags:',
+    '  - 问答',
+    `created: ${dayString()}`,
+    '---',
+    '',
+    `# ${askSaveSlug(question)}`,
+    '',
+    `> ${String(question ?? '').trim()}`,
+    '',
+    String(answer ?? '').trim(),
+    '',
+    list.length > 0 ? ['## 来源', '', ...list].join('\n') : '',
+  ]
+    .filter((section) => section !== '')
+    .join('\n')
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +2047,56 @@ export function apply(ctx) {
       },
     },
     {
+      name: 'obsidian_tasks',
+      description: 'List unchecked tasks (- [ ]) across the vault, newest note first, optionally scoped to a date range or folder, with the note path and heading for each. Use it for "open todos / 未完成待办" questions.',
+      parameters: {
+        folder: { type: 'string', description: '限定目录，如 项目' },
+        since: { type: 'string', description: '起始日期 YYYY-MM-DD（按笔记日期过滤）' },
+        until: { type: 'string', description: '截止日期 YYYY-MM-DD' },
+        limit: { type: 'integer', description: '返回条数，默认 80，最大 160' },
+      },
+      output: {
+        schema: { type: 'object', properties: { total: { type: 'integer' }, tasks: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, text: { type: 'string' }, date: { type: 'string' } } } } } },
+        render: (_a, v) => (v.total === 0 ? [{ type: 'text', text: '没有未完成的待办。' }] : [{ type: 'text', text: `共 ${v.total} 条未完成（显示 ${v.tasks.length}）\n${v.tasks.map((task) => `- [[${task.path}]]${task.heading !== '' ? ` · ${task.heading}` : ''}：${task.text}`).join('\n')}` }]),
+      },
+      async execute(args, exec) {
+        const vault = await ready(exec.signal)
+        const since = typeof args.since === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(args.since) ? args.since : '0000-01-01'
+        const until = typeof args.until === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(args.until) ? args.until : '9999-12-31'
+        const scope = typeof args.folder === 'string' && args.folder.trim() !== '' ? args.folder.trim().replace(/\/+$/, '') : null
+        const rows = collectOpenTasks(vault, { start: since, end: until })
+          .filter((task) => scope === null || task.path === scope || task.path.startsWith(`${scope}/`))
+        rows.sort((a, b) => String(b.date ?? '').localeCompare(String(a.date ?? '')) || a.path.localeCompare(b.path, 'zh'))
+        const limit = Math.min(Math.max(Number(args.limit) || 80, 1), 160)
+        return { total: rows.length, tasks: rows.slice(0, limit) }
+      },
+      presentCall: (args) => ({ card: 'generic', title: `列出待办${args.folder ? `：${args.folder}` : ''}`, kind: 'other', rawInput: args }),
+    },
+    {
+      name: 'obsidian_edit',
+      description: 'Precise literal search/replace inside one existing note. Refuses when the find text matches more than once unless replaceAll is true, and always backs up the previous content. Prefer this over rewriting a whole note with obsidian_write when only a passage changes.',
+      parameters: {
+        path: { type: 'string', required: true, description: 'vault 相对路径' },
+        find: { type: 'string', required: true, description: '要替换的原文，必须与文件内容逐字一致' },
+        replace: { type: 'string', required: true, description: '替换后的文本（可为空串表示删除）' },
+        replaceAll: { type: 'boolean', description: '替换全部匹配，默认只允许唯一匹配' },
+      },
+      output: {
+        schema: { type: 'object', properties: { path: { type: 'string' }, changes: { type: 'integer' }, bytes: { type: 'integer' }, backup: { type: 'string' } } },
+        render: (_a, v) => [{ type: 'text', text: `已编辑 ${v.path}（替换 ${v.changes} 处，现 ${v.bytes} 字节）${v.backup ? `\n备份：${v.backup}` : ''}` }],
+      },
+      async execute(args, exec) {
+        const vault = await ready(exec.signal)
+        return editNote(vault.root, {
+          path: String(args.path ?? ''),
+          find: String(args.find ?? ''),
+          replace: String(args.replace ?? ''),
+          replaceAll: args.replaceAll === true,
+        })
+      },
+      presentCall: (args) => ({ card: 'generic', title: `编辑笔记：${args.path}`, kind: 'other', rawInput: args }),
+    },
+    {
       name: 'obsidian_reindex',
       description: 'Force a full rescan of the vault. Use it after the user edits notes outside the harness (in Obsidian) and expects the change to be visible immediately.',
       parameters: { full: { type: 'boolean', description: '默认 true' } },
@@ -1114,7 +2125,7 @@ export function apply(ctx) {
         text: () =>
           index.root === ''
             ? '## Obsidian vault\nNo vault is mounted yet. If the user asks about "my notes" and no vault is mounted, tell them to open the Obsidian panel (left sidebar) and pick a directory; do not guess note contents.'
-            : `## Obsidian vault (mounted)\nVault root: ${index.root}\nNotes indexed: ${index.notes.size}\nUse obsidian_search to locate notes (it matches Chinese by character bigrams), obsidian_read to read one, obsidian_daily for diary entries, obsidian_stats for counting questions, and obsidian_append/obsidian_write to add content. Writing is permitted without asking for confirmation; create-mode never overwrites. Cite the vault-relative path of any note you rely on.`,
+            : `## Obsidian vault (mounted)\nVault root: ${index.root}\nNotes indexed: ${index.notes.size}\nUse obsidian_search to locate notes (it matches Chinese by character bigrams), obsidian_read to read one, obsidian_daily for diary entries, obsidian_tasks for open todos, obsidian_stats for counting questions, obsidian_edit for precise in-place edits, and obsidian_append/obsidian_write to add content. Writing is permitted without asking for confirmation; create-mode never overwrites and edits are backed up. Cite the vault-relative path of any note you rely on.`,
       }),
     'obsidian: prompt section',
   )
@@ -1161,8 +2172,15 @@ export function apply(ctx) {
         ...(index.root === '' ? { mounted: false, vault: '', noteCount: 0, tagCount: 0, folderCount: 0, ageMs: null, skipped: 0, scannedAt: 0 } : statusPayload(index)),
         configured: state.vaultPath,
         writeMode: state.writeMode,
+        folderRoles: index.root === '' ? null : await getFolderRoles(index.root),
         candidates: vaults,
       })
+    })
+
+    route('models', async (_req, res) => {
+      const llm = ctx.get('llm')
+      if (llm === undefined || llm === null) return sendJson(res, 503, { error: '当前环境没有可用的模型服务' })
+      sendJson(res, 200, await listModelCatalog(ctx, llm))
     })
 
     route('vault', async (req, res) => {
@@ -1231,6 +2249,94 @@ export function apply(ctx) {
       }))
     })
 
+    route('overview', async (_req, res) => {
+      const vault = await mountedVault()
+      const stats = computeStats(vault, { groupBy: 'folder' })
+      const notes = [...vault.notes.values()]
+      const today = dayString()
+      const weekStart = shiftDay(today, -6)
+      const monthStart = `${today.slice(0, 8)}01`
+      let weekNotes = 0
+      let monthNotes = 0
+      const folders = new Set()
+      const tags = new Set()
+      for (const note of notes) {
+        if (note.folder !== '') folders.add(note.folder.split('/')[0])
+        for (const tag of note.tags) tags.add(tag)
+        if (note.date !== null && note.date >= weekStart && note.date <= today) weekNotes += 1
+        if (note.date !== null && note.date >= monthStart && note.date <= today) monthNotes += 1
+      }
+      const recentNotes = notes
+        .slice()
+        .sort((a, b) => String(b.date ?? '').localeCompare(String(a.date ?? '')) || b.mtimeMs - a.mtimeMs)
+        .slice(0, 6)
+        .map((note) => ({ path: note.rel, title: note.title, date: note.date, folder: note.folder, mtimeMs: note.mtimeMs }))
+      sendJson(res, 200, {
+        noteCount: stats.noteCount,
+        folderCount: folders.size,
+        tagCount: tags.size,
+        cjkChars: stats.cjkChars,
+        weekNotes,
+        monthNotes,
+        tasksTotal: stats.tasksTotal,
+        tasksDone: stats.tasksDone,
+        tasksOpen: Math.max(0, stats.tasksTotal - stats.tasksDone),
+        completion: stats.completion,
+        topFolders: stats.rows.slice(0, 6),
+        recentNotes,
+        updatedAt: vault.scannedAt,
+      })
+    })
+
+    // Server-sent events: retrieval metadata first, then token deltas from the
+    // same model route new chats use. The panel owns rendering; this route only
+    // streams plain text and source paths.
+    route('ask', async (req, res) => {
+      if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' })
+      const body = await readJson(req)
+      const question = String(body.question ?? '').trim()
+      if (question === '') return sendJson(res, 400, { error: '缺少 question' })
+      if (question.length > 4000) return sendJson(res, 400, { error: '问题太长（最多 4000 字）' })
+      const provider = String(body.provider ?? '').trim()
+      const model = String(body.model ?? '').trim()
+      if (provider.length > 200 || model.length > 200) return sendJson(res, 400, { error: '模型标识过长' })
+      const llm = ctx.get('llm')
+      if (llm === undefined || llm === null) return sendJson(res, 503, { error: '当前环境没有可用的模型服务' })
+      const vault = await mountedVault()
+
+      res.statusCode = 200
+      res.setHeader('content-type', 'text/event-stream; charset=utf-8')
+      res.setHeader('cache-control', 'no-cache, no-transform')
+      res.setHeader('connection', 'keep-alive')
+      res.setHeader('x-accel-buffering', 'no')
+      if (typeof res.flushHeaders === 'function') res.flushHeaders()
+      const controller = new AbortController()
+      const close = () => {
+        if (!res.writableEnded) controller.abort()
+      }
+      req.on('aborted', close)
+      res.on('close', close)
+      const emit = (event) => {
+        if (res.writableEnded === true) return
+        try {
+          res.write(`event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`)
+        } catch {
+          /* the peer may have gone away mid-token */
+        }
+      }
+      try {
+        await streamAskAnswer(ctx, vault, { question, history: body.history, prior: body.prior, deep: body.deep === true, provider, model }, emit, controller.signal)
+      } catch (error) {
+        emit({ type: 'error', message: error instanceof Error ? error.message : String(error) })
+      } finally {
+        try {
+          res.end()
+        } catch {
+          /* already closed */
+        }
+      }
+    })
+
     route('write', async (req, res) => {
       if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' })
       const body = await readJson(req)
@@ -1254,6 +2360,49 @@ export function apply(ctx) {
       return sendJson(res, 200, result)
     })
 
+    route('ask-save', async (req, res) => {
+      if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' })
+      const body = await readJson(req)
+      const question = String(body.question ?? '').trim()
+      const answer = String(body.answer ?? '').trim()
+      if (question === '' || answer === '') return sendJson(res, 400, { error: '需要 question 与 answer' })
+      if (question.length > 4000 || answer.length > 60000) return sendJson(res, 400, { error: '内容过长' })
+      const vault = await mountedVault()
+      const content = askSaveMarkdown(question, answer, Array.isArray(body.sources) ? body.sources : [])
+      const base = `问答/${dayString()} ${askSaveSlug(question)}`
+      const candidates = [`${base}.md`, ...[2, 3, 4, 5].map((n) => `${base} ${n}.md`), `${base} ${Date.now()}.md`]
+      let lastError = null
+      for (const candidate of candidates) {
+        try {
+          const result = await writeNote(vault.root, { path: candidate, content, mode: 'create' })
+          await index.refresh()
+          return sendJson(res, 200, result)
+        } catch (error) {
+          lastError = error
+        }
+      }
+      throw lastError instanceof Error ? lastError : new Error('保存失败')
+    })
+
+    route('feedback', async (req, res) => {
+      if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' })
+      const body = await readJson(req)
+      const rating = body.rating === 'up' || body.rating === 'down' ? body.rating : null
+      if (rating === null) return sendJson(res, 400, { error: 'rating 需要 up 或 down' })
+      const row = {
+        ts: new Date().toISOString(),
+        rating,
+        question: String(body.question ?? '').slice(0, 2000),
+        model: typeof body.model === 'string' ? body.model.slice(0, 200) : '',
+        matched: Number(body.matched) || 0,
+        strongMatches: Number(body.strongMatches) || 0,
+        characters: Number(body.characters) || 0,
+      }
+      await fsp.mkdir(DATA_DIR, { recursive: true })
+      await fsp.appendFile(path.join(DATA_DIR, 'feedback.jsonl'), `${JSON.stringify(row)}\n`, 'utf8')
+      return sendJson(res, 200, { ok: true })
+    })
+
     route('reindex', async (req, res) => {
       if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' })
       const vault = await mountedVault()
@@ -1261,4 +2410,30 @@ export function apply(ctx) {
       return sendJson(res, 200, statusPayload(vault))
     })
   }, 'obsidian: http routes')
+}
+
+// Pure helpers exposed for the zero-dependency `node --test` suite in test/.
+export const __test = {
+  ROLE_DEFAULT_DIRS,
+  normalizeFolderRoles,
+  folderInRole,
+  bigrams,
+  searchNotes,
+  computeStats,
+  collectOpenTasks,
+  excerptAround,
+  detectAskRange,
+  cleanAskQuery,
+  parseCnNumber,
+  dayFromString,
+  shiftDay,
+  dayString,
+  isoWeekMonday,
+  applyDateFormat,
+  parseYamlLite,
+  parseNote,
+  absOf,
+  buildAskBundle,
+  writeNote,
+  editNote,
 }

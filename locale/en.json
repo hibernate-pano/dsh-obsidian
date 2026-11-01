@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Obsidian Notes",
-    "description": "Mounts an Obsidian vault: a sidebar panel to browse, search and preview notes, plus agent tools to search, summarize, count and write your notes."
+    "description": "Brings an Obsidian vault into Harness: streaming global Q&A with citations and follow-ups that keep the previous turn's scope, one-click save-as-note and quality feedback, configurable folder roles, serif reading presets, a per-panel model picker and slash templates, plus note browsing, search, preview, stats, editing and writing."
   },
   "panel": "Obsidian notes"
 }
